@@ -1,90 +1,140 @@
-# open-computer-use
+# foreground-open-computer-use-win
 
-[![English](https://img.shields.io/badge/English-Click-yellow)](./README.md)
-[![简体中文](https://img.shields.io/badge/简体中文-点击查看-orange)](./README.zh-CN.md)
+**Windows-only fork** of [QwenLM/open-computer-use](https://github.com/QwenLM/open-computer-use) — foreground Computer Use with real cursor/keyboard input. **Tested only in [opencode](https://opencode.ai).**
+
+> Unlike upstream, this build does **not** require Node.js — just run the `.exe` directly. The PowerShell runtime is embedded into the binary via `//go:embed` (`apps/OpenComputerUseWindows/main.go:22`).
+
+Download the latest binary from **Releases**: `open-computer-use.exe` (Windows x64, Go 1.22+, no dependencies).
 
 ---
 
-MCP-based Computer Use service for [Qwen Code](https://github.com/QwenLM/qwen-code) and any MCP client — controls macOS, Linux, and Windows via accessibility APIs.
+## How it differs from upstream `QwenLM/open-computer-use`
 
-Published to npm as [`@qwen-code/open-computer-use`](https://www.npmjs.com/package/@qwen-code/open-computer-use).
+This fork patches only two source files: `apps/OpenComputerUseWindows/main.go` and `apps/OpenComputerUseWindows/runtime.ps1` (based on `@qwen-code/open-computer-use` v0.2.3). UIA **reading** (element tree, snapshots, `get_app_state`) is untouched.
 
-## Demo
+### Core change: synthetic `PostMessage` → real system input
 
-https://github.com/user-attachments/assets/cd0d1644-99e5-47fc-b998-c1eb3c1aabff
+Upstream `runtime.ps1` sends mouse/keyboard via `PostMessage` (`WM_MOUSEMOVE`/`WM_LBUTTONDOWN`/`WM_KEYDOWN`/`WM_CHAR` directly into the window queue). The real cursor never moves and the OS input system is bypassed — apps that hit-test via `GetCursorPos` (Paint ribbon, WPF, etc.) ignore such clicks. Chromium also advertises `ScrollPattern` but silently ignores `Scroll()` calls, so upstream scroll in Chrome did not work.
 
-## Quick Start
+**Patched runtime** uses real hardware input:
 
-```bash
-npm i -g @qwen-code/open-computer-use
+| Component | Upstream | This fork |
+|---|---|---|
+| `OCUWin32` class (C# P/Invoke) | `PostMessage`, `SendMessage`, `ScreenToClient`, `POINT` | `SetCursorPos`, `mouse_event`, `keybd_event`, `SendInput` + structs `MOUSEINPUT`/`KEYBDINPUT`/`InputUnion`/`INPUT` + `GetForegroundWindow`, `GetWindowThreadProcessId`, `GetCurrentThreadId`, `AttachThreadInput`, `SetForegroundWindow`, `SetFocus`, `ShowWindow`, `SetWindowPos`, `IsHungAppWindow` |
+| `Send-MouseClick` | `PostMessage WM_MOUSEMOVE/DOWN/UP` | `SetCursorPos` + `mouse_event` (down `0x0002`/`0x0008`/`0x0020`, up `0x0004`/`0x0010`/`0x0040`, pauses 40/50ms) |
+| `Send-Drag` | `PostMessage` left-only | `SetCursorPos` → `mouse_event DOWN` → 12 interpolated steps (20ms) → `mouse_event UP` — button from `mouse_button` param |
+| `Send-Scroll` | `PostMessage WM_MOUSEWHEEL/HWHEEL` | `SetCursorPos` + `mouse_event(WHEEL 0x0800 / HWHEEL 0x1000, delta ±120×pages)` |
+| `Send-Key` | `PostMessage WM_KEYDOWN/UP` | `keybd_event` down/up (`KEYEVENTF_KEYUP=0x0002`) with modifiers |
+| `Send-Text` | `PostMessage WM_CHAR` per char | `SendInput` with `INPUT_KEYBOARD` type=1 + `KEYEVENTF_UNICODE=0x0004` (`[uint16]$code` — `[ushort]` does not exist in PS 5.1) |
+
+### Tool handlers — always direct input (no UIA pattern fallback)
+
+| Tool | Upstream (UIA-first) | This fork |
+|---|---|---|
+| `click` | `Invoke-PreferredClick` (Invoke/SelectionItem/Toggle) → fallback | Always `Send-MouseClick` at coordinates |
+| `scroll` | `Invoke-Scroll` (ScrollPattern) → fallback | Always `Send-Scroll` (real wheel) — fixes Chrome |
+| `type_text` | `Invoke-TypeText` (EditHandle/ValuePattern) → fallback | Always `Send-Text` (`SendInput` UNICODE) |
+| `perform_secondary_action` | `Invoke-SecondaryAction` | Always `Send-MouseClick` on element coords |
+| `set_value` | `ValuePattern.SetValue` | Click + `Ctrl+A` + `Send-Text` |
+| `drag` | left-only | `Send-Drag` with `mouse_button` (left/right/middle) |
+| `press_key` | `PostMessage` | `keybd_event` |
+
+Removed dead code: `Invoke-PreferredClick`, `Invoke-Scroll`, `Invoke-TypeText`, `Invoke-SecondaryAction`, `Find-TextEntryElement`, `Get-NativeWindowHandle`, `Send-TextToEditHandle`, plus unused P/Invokes.
+
+### `main.go` — drag now supports mouse button
+
+`service.drag` signature extended: `drag(app, from_x, from_y, to_x, to_y, mouseButton string)` (`apps/OpenComputerUseWindows/main.go:316`). `psRequest.MouseButton` is populated from `mouse_button` arg (default `left`, enum `left`/`right`/`middle`). JSON schema for `drag` updated accordingly (`main.go:549`).
+
+### `Ensure-Foreground` — bring target window to front before every action
+
+Real clicks require the target window to be foreground (otherwise they hit the window on top).
+
+```powershell
+ShowWindow(SW_RESTORE=9)  # if minimized
+→ AttachThreadInput(myThread, fgThread) # bypass foreground lock, no Alt-key trick
+→ SetWindowPos(TOPMOST, SWP_NOMOVE|SWP_NOSIZE)
+→ SetWindowPos(NOTOPMOST, SWP_NOMOVE|SWP_NOSIZE)
+→ SetForegroundWindow + SetFocus → detach → verify by PID (not handle)
 ```
 
-**On macOS, run it once and grant `Accessibility` and `Screen Recording`. Windows and Linux do not need this step.**
+Prevents hanging on hung windows via `IsHungAppWindow`. On `type_text`/`press_key` it hard-fails if focus cannot be obtained (text would go to wrong window). After raising, window rect is re-read and click/drag points are recalculated.
 
-```bash
-open-computer-use
-```
+### Side effects
 
-Add it to your MCP client config:
+* Moves the real cursor; target window must be visible (not background-capable).
+* Agent sees only a single window (not the full screen).
+* Screenshot/tree via UIA still works for `get_app_state`.
+
+---
+
+## No Node.js required — run the exe directly
+
+Upstream distributes via npm and requires Node.js. This fork embeds `runtime.ps1` — the exe is self-contained (Go stdlib only).
+
+Example `opencode.jsonc` (from the author's setup):
 
 ```json
-{
-  "mcpServers": {
-    "open-computer-use": {
-      "command": "open-computer-use",
-      "args": ["mcp"]
-    }
+"mcp": {
+  "open-computer-use": {
+    "type": "local",
+    "command": [
+      "C:\\Users\\User\\Desktop\\node-v24.18.0-win-x64\\open-computer-use.cmd",
+      "mcp"
+    ],
+    "enabled": false
+  },
+  "foreground-open-computer-use": {
+    "type": "local",
+    "command": [
+      "C:\\Users\\User\\Desktop\\node-v24.18.0-win-x64\\ocu-foreground\\open-computer-use.exe",
+      "mcp"
+    ],
+    "enabled": false
   }
 }
 ```
 
-## CLI Usage
+Replace the path with where you downloaded the release binary, e.g.:
 
-```bash
-# Call a single Computer Use tool and print the MCP-style JSON result
-open-computer-use call list_apps
-open-computer-use call get_app_state --args '{"app":"TextEdit"}'
-
-# Run a sequence in one process so element_index state can be reused
-open-computer-use call --calls '[{"tool":"get_app_state","args":{"app":"TextEdit"}},{"tool":"press_key","args":{"app":"TextEdit","key":"Return"}}]'
-open-computer-use call --calls-file examples/textedit-overlay-seq.json --sleep 0.5
-
-# Check permissions; onboarding only opens when something is missing
-open-computer-use doctor
-
-# Show help
-open-computer-use -h
+```json
+"foreground-open-computer-use": {
+  "type": "local",
+  "command": ["C:\\Tools\\open-computer-use.exe", "mcp"]
+}
 ```
 
-## Configuration
+---
 
-### Image capture (macOS)
+## Quick start (Windows)
 
-The `get_app_state` screenshot and the post-action screenshots attached to every action tool can be tuned through environment variables read at capture time. All variables are optional; unset / non-numeric / out-of-range values fall back to the built-in defaults.
+1. Download `open-computer-use.exe` from [Releases](https://github.com/4eJIoBek1/foreground-open-computer-use-win/releases).
+2. Add to your MCP config as above (`command`: path to exe, `args`: `["mcp"]`).
+3. In opencode, enable `foreground-open-computer-use` and call `get_app_state` before actions.
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPEN_COMPUTER_USE_IMAGE_CAPTURE_TIMEOUT` | `5` | Seconds to wait for `SCScreenshotManager.captureImage` before giving up. The MCP result still includes the accessibility tree on timeout; only the `image` block is dropped. Positive float. |
-| `OPEN_COMPUTER_USE_IMAGE_MAX_BYTES` | `900000` | Byte budget for the encoded PNG. The downsampler iterates `scale *= 0.85` until the encoded data fits this budget OR `OPEN_COMPUTER_USE_IMAGE_MIN_SCALE` is reached. Positive integer. |
-| `OPEN_COMPUTER_USE_IMAGE_MAX_DIMENSION` | `1280` | Long-edge pixel cap for the returned PNG. Initial scale is `min(1, OPEN_COMPUTER_USE_IMAGE_MAX_DIMENSION / largestNativeDimension)`, then clamped up to `OPEN_COMPUTER_USE_IMAGE_MIN_SCALE`. Positive float. |
-| `OPEN_COMPUTER_USE_IMAGE_MIN_SCALE` | `0.25` | Floor on the downsample ratio. Neither `MAX_DIMENSION` nor `MAX_BYTES` will shrink below `MIN_SCALE × native`; a `MAX_DIMENSION` that would require less is clamped to this floor (it does **not** fall back to the full-size original). Lower it for more aggressive sizes. Float in `(0, 1]`. |
+CLI also works standalone:
 
-Coordinate accuracy is preserved across any downsampling — coordinate tools (`click`, `drag`, `scroll`) read the actual pixel dimensions back from the returned PNG and rescale model-supplied coordinates against the live window bounds.
+```bash
+open-computer-use.exe mcp
+open-computer-use.exe list-apps
+open-computer-use.exe snapshot "Notepad"
+open-computer-use.exe call click --args '{"app":"Notepad","x":100,"y":100}'
+```
 
-These variables only affect macOS today. The Windows and Linux runtimes return native-size PNGs without downsampling.
+## Building from source
 
-See [docs/IMAGE_CAPTURE.md](docs/IMAGE_CAPTURE.md) for the full capture → downsample → encode pipeline, the constraint interaction (maxDimension / maxBytes / minScale), coordinate-mapping details, and worked examples.
+Requires Go 1.22+ (stdlib only, `runtime.ps1` embedded).
 
-## Acknowledge
+```powershell
+cd apps/OpenComputerUseWindows
+go build -o open-computer-use.exe .
+.\open-computer-use.exe mcp
+```
 
-This project is a [QwenLM](https://github.com/QwenLM) fork of [`iFurySt/open-codex-computer-use`](https://github.com/iFurySt/open-codex-computer-use). We thank the original author for the foundational work on macOS accessibility-driven computer-use patterns.
+## Platform support
 
-## Differences from upstream
+* **Windows only** — tested only in **opencode** on Windows 10/11 with PowerShell 5.1.
+* macOS/Linux runtimes from upstream are not included in this fork's release artifact (sources remain in repo).
 
-- **Cross-platform**: Added Windows (Go + PowerShell UI Automation) and Linux (Go + Python AT-SPI) runtimes
-- **npm distribution**: Published as [`@qwen-code/open-computer-use`](https://www.npmjs.com/package/@qwen-code/open-computer-use) for easy installation
-- **MCP server**: Full MCP stdio transport with 9 Computer Use tools
-- **CLI tools**: Added `doctor`, `call`, `snapshot`, `list-apps` commands for diagnostics and scripting
-- **Image capture tuning**: Environment variables for screenshot size/quality control
-- **Qwen Code skill**: Installable skill for Qwen Code agent integration
-- **Cursor Motion**: Retained in `experiments/` but not built or released in CI
+## Credits
+
+Fork of [QwenLM/open-computer-use](https://github.com/QwenLM/open-computer-use) (itself a fork of `iFurySt/open-codex-computer-use`). See `PATCH.md` logic and `apps/OpenComputerUseWindows/main.go` / `runtime.ps1` for full diff.

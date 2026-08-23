@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [string]$OperationPath
 )
@@ -22,44 +22,85 @@ public static class OCUWin32 {
         public int Bottom;
     }
 
-    [StructLayout(LayoutKind.Sequential)]
-    public struct POINT {
-        public int X;
-        public int Y;
-    }
-
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
 
     [DllImport("user32.dll")]
-    public static extern bool ScreenToClient(IntPtr hWnd, ref POINT point);
+    public static extern bool SetCursorPos(int x, int y);
 
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern bool PostMessage(IntPtr hWnd, UInt32 msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")]
+    public static extern void mouse_event(uint dwFlags, uint dx, uint dy, int dwData, UIntPtr dwExtraInfo);
 
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr SendMessage(IntPtr hWnd, UInt32 msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")]
+    public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr SendMessage(IntPtr hWnd, UInt32 msg, IntPtr wParam, string lParam);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MOUSEINPUT {
+        public int dx;
+        public int dy;
+        public uint mouseData;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KEYBDINPUT {
+        public ushort wVk;
+        public ushort wScan;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    public struct InputUnion {
+        [FieldOffset(0)] public MOUSEINPUT mi;
+        [FieldOffset(0)] public KEYBDINPUT ki;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct INPUT {
+        public uint type;
+        public InputUnion u;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll")]
+    public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetFocus(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsHungAppWindow(IntPtr hWnd);
 }
 "@
 
-$WM_SETTEXT = 0x000C
-$WM_MOUSEMOVE = 0x0200
-$WM_LBUTTONDOWN = 0x0201
-$WM_LBUTTONUP = 0x0202
-$WM_RBUTTONDOWN = 0x0204
-$WM_RBUTTONUP = 0x0205
-$WM_MBUTTONDOWN = 0x0207
-$WM_MBUTTONUP = 0x0208
-$WM_MOUSEWHEEL = 0x020A
-$WM_MOUSEHWHEEL = 0x020E
-$WM_KEYDOWN = 0x0100
-$WM_KEYUP = 0x0101
-$WM_CHAR = 0x0102
-$EM_SETSEL = 0x00B1
-$EM_REPLACESEL = 0x00C2
+$SWP_NOSIZE = 0x0001
+$SWP_NOMOVE = 0x0002
+$HWND_TOPMOST = [IntPtr](-1)
+$HWND_NOTOPMOST = [IntPtr](-2)
 
 function Test-EnvFlagEnabled([string]$name) {
     $value = [Environment]::GetEnvironmentVariable($name)
@@ -80,16 +121,6 @@ function New-Frame($x, $y, $width, $height) {
         width = [double]$width
         height = [double]$height
     }
-}
-
-function ConvertTo-LParam([int]$x, [int]$y) {
-    $packed = (($y -band 0xffff) -shl 16) -bor ($x -band 0xffff)
-    [IntPtr]$packed
-}
-
-function ConvertTo-WheelWParam([int]$delta) {
-    $packed = (($delta -band 0xffff) -shl 16)
-    [IntPtr]$packed
 }
 
 function Get-WindowRectFrame([IntPtr]$hwnd) {
@@ -126,103 +157,95 @@ function Get-ScreenPoint($localFrame, $windowBounds) {
 }
 
 function Send-MouseClick([IntPtr]$hwnd, [int]$screenX, [int]$screenY, [string]$button, [int]$count) {
-    $point = New-Object OCUWin32+POINT
-    $point.X = $screenX
-    $point.Y = $screenY
-    [void][OCUWin32]::ScreenToClient($hwnd, [ref]$point)
-    $lParam = ConvertTo-LParam $point.X $point.Y
-
-    $down = $WM_LBUTTONDOWN
-    $up = $WM_LBUTTONUP
-    $downFlag = 0x0001
+    $downFlag = 0x0002
+    $upFlag = 0x0004
     if ($button -eq "right") {
-        $down = $WM_RBUTTONDOWN
-        $up = $WM_RBUTTONUP
-        $downFlag = 0x0002
+        $downFlag = 0x0008
+        $upFlag = 0x0010
     } elseif ($button -eq "middle") {
-        $down = $WM_MBUTTONDOWN
-        $up = $WM_MBUTTONUP
-        $downFlag = 0x0010
+        $downFlag = 0x0020
+        $upFlag = 0x0040
     }
-
+    [void][OCUWin32]::SetCursorPos($screenX, $screenY)
+    Start-Sleep -Milliseconds 20
     $repeat = [math]::Max(1, $count)
     for ($i = 0; $i -lt $repeat; $i++) {
-        [void][OCUWin32]::PostMessage($hwnd, $WM_MOUSEMOVE, [IntPtr]::Zero, $lParam)
-        [void][OCUWin32]::PostMessage($hwnd, $down, [IntPtr]$downFlag, $lParam)
-        Start-Sleep -Milliseconds 35
-        [void][OCUWin32]::PostMessage($hwnd, $up, [IntPtr]::Zero, $lParam)
+        [void][OCUWin32]::mouse_event($downFlag, 0, 0, 0, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 40
+        [void][OCUWin32]::mouse_event($upFlag, 0, 0, 0, [UIntPtr]::Zero)
         Start-Sleep -Milliseconds 50
     }
 }
 
-function Send-Drag([IntPtr]$hwnd, [int]$fromX, [int]$fromY, [int]$toX, [int]$toY) {
-    $start = New-Object OCUWin32+POINT
-    $start.X = $fromX
-    $start.Y = $fromY
-    [void][OCUWin32]::ScreenToClient($hwnd, [ref]$start)
-    $end = New-Object OCUWin32+POINT
-    $end.X = $toX
-    $end.Y = $toY
-    [void][OCUWin32]::ScreenToClient($hwnd, [ref]$end)
-
+function Send-Drag([IntPtr]$hwnd, [int]$fromX, [int]$fromY, [int]$toX, [int]$toY, [string]$button) {
+    $downFlag = 0x0002
+    $upFlag = 0x0004
+    if ($button -eq "right") {
+        $downFlag = 0x0008
+        $upFlag = 0x0010
+    } elseif ($button -eq "middle") {
+        $downFlag = 0x0020
+        $upFlag = 0x0040
+    }
+    [void][OCUWin32]::SetCursorPos($fromX, $fromY)
+    Start-Sleep -Milliseconds 30
+    [void][OCUWin32]::mouse_event($downFlag, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 40
     $steps = 12
-    $startParam = ConvertTo-LParam $start.X $start.Y
-    [void][OCUWin32]::PostMessage($hwnd, $WM_MOUSEMOVE, [IntPtr]::Zero, $startParam)
-    [void][OCUWin32]::PostMessage($hwnd, $WM_LBUTTONDOWN, [IntPtr]1, $startParam)
     for ($i = 1; $i -le $steps; $i++) {
-        $x = [int][math]::Round($start.X + (($end.X - $start.X) * $i / $steps))
-        $y = [int][math]::Round($start.Y + (($end.Y - $start.Y) * $i / $steps))
-        [void][OCUWin32]::PostMessage($hwnd, $WM_MOUSEMOVE, [IntPtr]1, (ConvertTo-LParam $x $y))
+        $x = [int][math]::Round($fromX + (($toX - $fromX) * $i / $steps))
+        $y = [int][math]::Round($fromY + (($toY - $fromY) * $i / $steps))
+        [void][OCUWin32]::SetCursorPos($x, $y)
         Start-Sleep -Milliseconds 20
     }
-    [void][OCUWin32]::PostMessage($hwnd, $WM_LBUTTONUP, [IntPtr]::Zero, (ConvertTo-LParam $end.X $end.Y))
+    Start-Sleep -Milliseconds 30
+    [void][OCUWin32]::mouse_event($upFlag, 0, 0, 0, [UIntPtr]::Zero)
 }
 
 function Send-Scroll([IntPtr]$hwnd, [int]$screenX, [int]$screenY, [string]$direction, [double]$pages) {
-    $point = New-Object OCUWin32+POINT
-    $point.X = $screenX
-    $point.Y = $screenY
-    [void][OCUWin32]::ScreenToClient($hwnd, [ref]$point)
-    $lParam = ConvertTo-LParam $point.X $point.Y
     $delta = [int][math]::Round(120 * $pages)
-    $message = $WM_MOUSEWHEEL
-    if ($direction -eq "down" -or $direction -eq "right") {
-        $delta = -1 * $delta
-    }
+    $flags = 0x0800
+    if ($direction -eq "down") { $delta = -$delta }
     if ($direction -eq "left" -or $direction -eq "right") {
-        $message = $WM_MOUSEHWHEEL
+        $flags = 0x1000
+        if ($direction -eq "left") { $delta = -$delta }
     }
-    [void][OCUWin32]::PostMessage($hwnd, $message, (ConvertTo-WheelWParam $delta), $lParam)
+    [void][OCUWin32]::SetCursorPos($screenX, $screenY)
+    Start-Sleep -Milliseconds 15
+    [void][OCUWin32]::mouse_event($flags, 0, 0, $delta, [UIntPtr]::Zero)
 }
 
 function Send-Text([IntPtr]$hwnd, [string]$text) {
     foreach ($char in $text.ToCharArray()) {
-        [void][OCUWin32]::PostMessage($hwnd, $WM_CHAR, [IntPtr][int][char]$char, [IntPtr]::Zero)
+        $code = [int]$char
+        $inputs = @(
+            [OCUWin32+INPUT]@{
+                type = 1
+                u = [OCUWin32+InputUnion]@{
+                    ki = [OCUWin32+KEYBDINPUT]@{
+                        wVk = 0
+                        wScan = [uint16]$code
+                        dwFlags = 0x0004
+                        time = 0
+                        dwExtraInfo = [IntPtr]::Zero
+                    }
+                }
+            }
+            [OCUWin32+INPUT]@{
+                type = 1
+                u = [OCUWin32+InputUnion]@{
+                    ki = [OCUWin32+KEYBDINPUT]@{
+                        wVk = 0
+                        wScan = [uint16]$code
+                        dwFlags = 0x0004 -bor 0x0002
+                        time = 0
+                        dwExtraInfo = [IntPtr]::Zero
+                    }
+                }
+            }
+        )
+        [void][OCUWin32]::SendInput(2, $inputs, [System.Runtime.InteropServices.Marshal]::SizeOf([type][OCUWin32+INPUT]))
         Start-Sleep -Milliseconds 8
-    }
-}
-
-function Send-TextToEditHandle([IntPtr]$hwnd, [string]$text, $element) {
-    if ($hwnd -eq [IntPtr]::Zero) {
-        return $false
-    }
-
-    try {
-        [void][OCUWin32]::SendMessage($hwnd, $EM_SETSEL, [IntPtr](-1), [IntPtr](-1))
-        [void][OCUWin32]::SendMessage($hwnd, $EM_REPLACESEL, [IntPtr]1, $text)
-        return $true
-    } catch {
-    }
-
-    try {
-        $current = ""
-        if ($null -ne $element) {
-            $current = Get-ElementValue $element
-        }
-        [void][OCUWin32]::SendMessage($hwnd, $WM_SETTEXT, [IntPtr]::Zero, ($current + $text))
-        return $true
-    } catch {
-        return $false
     }
 }
 
@@ -268,16 +291,63 @@ function Send-Key([IntPtr]$hwnd, [string]$key) {
         }
     }
     foreach ($modifier in $modifiers) {
-        [void][OCUWin32]::PostMessage($hwnd, $WM_KEYDOWN, [IntPtr]$modifier, [IntPtr]::Zero)
+        [void][OCUWin32]::keybd_event([byte]$modifier, 0, 0, [UIntPtr]::Zero)
     }
     $vk = Get-VirtualKey $main
-    [void][OCUWin32]::PostMessage($hwnd, $WM_KEYDOWN, [IntPtr]$vk, [IntPtr]::Zero)
+    [void][OCUWin32]::keybd_event([byte]$vk, 0, 0, [UIntPtr]::Zero)
     Start-Sleep -Milliseconds 25
-    [void][OCUWin32]::PostMessage($hwnd, $WM_KEYUP, [IntPtr]$vk, [IntPtr]::Zero)
+    [void][OCUWin32]::keybd_event([byte]$vk, 0, 0x0002, [UIntPtr]::Zero)
     [array]::Reverse($modifiers)
     foreach ($modifier in $modifiers) {
-        [void][OCUWin32]::PostMessage($hwnd, $WM_KEYUP, [IntPtr]$modifier, [IntPtr]::Zero)
+        [void][OCUWin32]::keybd_event([byte]$modifier, 0, 0x0002, [UIntPtr]::Zero)
     }
+}
+
+function Test-IsTargetForeground([IntPtr]$hwnd) {
+    try {
+        $fg = [OCUWin32]::GetForegroundWindow()
+        if ($fg -eq [IntPtr]::Zero) {
+            return $false
+        }
+        $fgPid = 0
+        $targetPid = 0
+        [void][OCUWin32]::GetWindowThreadProcessId($fg, [ref]$fgPid)
+        [void][OCUWin32]::GetWindowThreadProcessId($hwnd, [ref]$targetPid)
+        return ($fgPid -eq $targetPid)
+    } catch {
+        return $false
+    }
+}
+
+function Ensure-Foreground([IntPtr]$hwnd) {
+    if (Test-IsTargetForeground $hwnd) {
+        return $true
+    }
+
+    [void][OCUWin32]::ShowWindow($hwnd, 9)
+
+    $fg = [OCUWin32]::GetForegroundWindow()
+    $myThread = [OCUWin32]::GetCurrentThreadId()
+    $fgThread = [OCUWin32]::GetWindowThreadProcessId($fg, [ref]0)
+
+    $attached = $false
+    if ($fgThread -ne $myThread -and -not [OCUWin32]::IsHungAppWindow($fg)) {
+        $attached = [OCUWin32]::AttachThreadInput($myThread, $fgThread, $true)
+    }
+
+    try {
+        [void][OCUWin32]::SetWindowPos($hwnd, $HWND_TOPMOST, 0, 0, 0, 0, $SWP_NOMOVE -bor $SWP_NOSIZE)
+        [void][OCUWin32]::SetWindowPos($hwnd, $HWND_NOTOPMOST, 0, 0, 0, 0, $SWP_NOMOVE -bor $SWP_NOSIZE)
+        [void][OCUWin32]::SetForegroundWindow($hwnd)
+        [void][OCUWin32]::SetFocus($hwnd)
+    } finally {
+        if ($attached) {
+            [void][OCUWin32]::AttachThreadInput($myThread, $fgThread, $false)
+        }
+    }
+
+    Start-Sleep -Milliseconds 150
+    return (Test-IsTargetForeground $hwnd)
 }
 
 function Resolve-App([string]$query) {
@@ -657,197 +727,6 @@ function Find-Element($process, $record) {
     return $null
 }
 
-function Get-CurrentPatternOrNull($element, $pattern) {
-    try {
-        return $element.GetCurrentPattern($pattern)
-    } catch {
-        return $null
-    }
-}
-
-function Invoke-PreferredClick($element) {
-    $invoke = Get-CurrentPatternOrNull $element ([Windows.Automation.InvokePattern]::Pattern)
-    if ($null -ne $invoke) {
-        $invoke.Invoke()
-        return $true
-    }
-    $selection = Get-CurrentPatternOrNull $element ([Windows.Automation.SelectionItemPattern]::Pattern)
-    if ($null -ne $selection) {
-        $selection.Select()
-        return $true
-    }
-    $toggle = Get-CurrentPatternOrNull $element ([Windows.Automation.TogglePattern]::Pattern)
-    if ($null -ne $toggle) {
-        $toggle.Toggle()
-        return $true
-    }
-    return $false
-}
-
-function Invoke-SecondaryAction($element, [string]$action) {
-    switch ($action.ToLowerInvariant()) {
-        "invoke" {
-            $pattern = Get-CurrentPatternOrNull $element ([Windows.Automation.InvokePattern]::Pattern)
-            if ($null -ne $pattern) { $pattern.Invoke(); return }
-        }
-        "toggle" {
-            $pattern = Get-CurrentPatternOrNull $element ([Windows.Automation.TogglePattern]::Pattern)
-            if ($null -ne $pattern) { $pattern.Toggle(); return }
-        }
-        "select" {
-            $pattern = Get-CurrentPatternOrNull $element ([Windows.Automation.SelectionItemPattern]::Pattern)
-            if ($null -ne $pattern) { $pattern.Select(); return }
-        }
-        "expand" {
-            $pattern = Get-CurrentPatternOrNull $element ([Windows.Automation.ExpandCollapsePattern]::Pattern)
-            if ($null -ne $pattern) { $pattern.Expand(); return }
-        }
-        "collapse" {
-            $pattern = Get-CurrentPatternOrNull $element ([Windows.Automation.ExpandCollapsePattern]::Pattern)
-            if ($null -ne $pattern) { $pattern.Collapse(); return }
-        }
-        "scrollintoview" {
-            $pattern = Get-CurrentPatternOrNull $element ([Windows.Automation.ScrollItemPattern]::Pattern)
-            if ($null -ne $pattern) { $pattern.ScrollIntoView(); return }
-        }
-        "setfocus" {
-            if (-not (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOCUS_ACTIONS")) {
-                throw "SetFocus is disabled by default to avoid stealing user focus; set OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOCUS_ACTIONS=1 to enable it."
-            }
-            $element.SetFocus()
-            return
-        }
-    }
-    throw "$action is not a valid secondary action for $($operation.element.index)"
-}
-
-function Invoke-Scroll($element, [string]$direction, [double]$pages) {
-    $scroll = Get-CurrentPatternOrNull $element ([Windows.Automation.ScrollPattern]::Pattern)
-    if ($null -eq $scroll) {
-        return $false
-    }
-    $horizontal = [Windows.Automation.ScrollAmount]::NoAmount
-    $vertical = [Windows.Automation.ScrollAmount]::NoAmount
-    if ($direction -eq "up") { $vertical = [Windows.Automation.ScrollAmount]::LargeDecrement }
-    elseif ($direction -eq "down") { $vertical = [Windows.Automation.ScrollAmount]::LargeIncrement }
-    elseif ($direction -eq "left") { $horizontal = [Windows.Automation.ScrollAmount]::LargeDecrement }
-    elseif ($direction -eq "right") { $horizontal = [Windows.Automation.ScrollAmount]::LargeIncrement }
-    $repeat = [math]::Max(1, [int][math]::Ceiling($pages))
-    for ($i = 0; $i -lt $repeat; $i++) {
-        $scroll.Scroll($horizontal, $vertical)
-        Start-Sleep -Milliseconds 40
-    }
-    return $true
-}
-
-function Find-TextEntryElement($process) {
-    try {
-        $focused = [Windows.Automation.AutomationElement]::FocusedElement
-        if ($null -ne $focused -and $focused.Current.ProcessId -eq $process.Id) {
-            $focusedValue = Get-CurrentPatternOrNull $focused ([Windows.Automation.ValuePattern]::Pattern)
-            if ($null -ne $focusedValue -and -not $focusedValue.Current.IsReadOnly) {
-                return $focused
-            }
-        }
-    } catch {
-    }
-
-    $root = Get-MainElement $process
-    foreach ($element in (Get-AllElements $root)) {
-        $valuePattern = Get-CurrentPatternOrNull $element ([Windows.Automation.ValuePattern]::Pattern)
-        if ($null -eq $valuePattern -or $valuePattern.Current.IsReadOnly) {
-            continue
-        }
-        $controlType = Get-ElementControlTypeName $element
-        if ($controlType -like "*Edit*" -or $controlType -like "*Document*") {
-            return $element
-        }
-    }
-
-    foreach ($element in (Get-AllElements $root)) {
-        $valuePattern = Get-CurrentPatternOrNull $element ([Windows.Automation.ValuePattern]::Pattern)
-        if ($null -ne $valuePattern -and -not $valuePattern.Current.IsReadOnly) {
-            return $element
-        }
-    }
-
-    return $null
-}
-
-function Get-NativeWindowHandle($element) {
-    $handle = Get-ElementInt64 $element "NativeWindowHandle"
-    if ($handle -le 0) {
-        return [IntPtr]::Zero
-    }
-    return [IntPtr]$handle
-}
-
-function Test-TextWindowHandleCandidate($process, $element) {
-    if ($null -eq $element) {
-        return $false
-    }
-    $handle = Get-NativeWindowHandle $element
-    if ($handle -eq [IntPtr]::Zero -or $handle -eq [IntPtr]$process.MainWindowHandle) {
-        return $false
-    }
-    $controlType = Get-ElementControlTypeName $element
-    $className = Get-ElementString $element "ClassName"
-    return (
-        $controlType -like "*Edit*" -or
-        $controlType -like "*Document*" -or
-        $className -like "*Edit*" -or
-        $className -like "*Rich*" -or
-        $className -like "*Text*"
-    )
-}
-
-function Find-TextEntryWindowHandle($process, $preferredElement) {
-    if (Test-TextWindowHandleCandidate $process $preferredElement) {
-        return Get-NativeWindowHandle $preferredElement
-    }
-
-    $root = Get-MainElement $process
-    foreach ($element in (Get-AllElements $root)) {
-        if (-not (Test-TextWindowHandleCandidate $process $element)) {
-            continue
-        }
-        $valuePattern = Get-CurrentPatternOrNull $element ([Windows.Automation.ValuePattern]::Pattern)
-        if ($null -ne $valuePattern -and -not $valuePattern.Current.IsReadOnly) {
-            return Get-NativeWindowHandle $element
-        }
-    }
-
-    foreach ($element in (Get-AllElements $root)) {
-        if (Test-TextWindowHandleCandidate $process $element) {
-            return Get-NativeWindowHandle $element
-        }
-    }
-
-    return [IntPtr]::Zero
-}
-
-function Invoke-TypeText($process, [string]$text) {
-    $element = Find-TextEntryElement $process
-    $targetHwnd = Find-TextEntryWindowHandle $process $element
-    if ($targetHwnd -ne [IntPtr]::Zero -and (Send-TextToEditHandle $targetHwnd $text $element)) {
-        return $true
-    }
-
-    if ($null -ne $element) {
-        $valuePattern = Get-CurrentPatternOrNull $element ([Windows.Automation.ValuePattern]::Pattern)
-        if ($null -ne $valuePattern -and -not $valuePattern.Current.IsReadOnly) {
-            if (-not (Test-EnvFlagEnabled "OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK")) {
-                throw "UIA ValuePattern text fallback is disabled by default because it may bring the target app to the foreground; set OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK=1 to enable it."
-            }
-            $current = ""
-            try { $current = [string]$valuePattern.Current.Value } catch {}
-            $valuePattern.SetValue($current + $text)
-            return $true
-        }
-    }
-    return $false
-}
-
 $operation = Get-Content -Raw -Path $OperationPath | ConvertFrom-Json
 
 try {
@@ -863,54 +742,59 @@ try {
 
         switch ($operation.tool) {
             "click" {
-                $handled = $false
-                if ($null -ne $element -and $operation.mouse_button -ne "right" -and $operation.mouse_button -ne "middle") {
-                    $handled = Invoke-PreferredClick $element
-                }
-                if (-not $handled) {
-                    if ($null -ne $operation.element -and $null -ne $operation.element.frame) {
-                        $point = Get-ScreenPoint $operation.element.frame $windowBounds
-                    } else {
-                        $point = [pscustomobject]@{
-                            x = [int][math]::Round($windowBounds.x + [double]$operation.x)
-                            y = [int][math]::Round($windowBounds.y + [double]$operation.y)
-                        }
+                if (-not (Ensure-Foreground $hwnd)) { throw "failed to bring app window to foreground" }
+                $fresh = Get-WindowRectFrame $hwnd
+                if ($null -ne $fresh) { $windowBounds = $fresh }
+                if ($null -ne $operation.element -and $null -ne $operation.element.frame) {
+                    $point = Get-ScreenPoint $operation.element.frame $windowBounds
+                } else {
+                    $point = [pscustomobject]@{
+                        x = [int][math]::Round($windowBounds.x + [double]$operation.x)
+                        y = [int][math]::Round($windowBounds.y + [double]$operation.y)
                     }
-                    Send-MouseClick $hwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
                 }
+                Send-MouseClick $hwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
             }
             "perform_secondary_action" {
                 if ($null -eq $element) { throw "unknown element_index '$($operation.element.index)'" }
-                Invoke-SecondaryAction $element $operation.action
+                if (-not (Ensure-Foreground $hwnd)) { throw "failed to bring app window to foreground" }
+                $fresh = Get-WindowRectFrame $hwnd
+                if ($null -ne $fresh) { $windowBounds = $fresh }
+                $point = Get-ScreenPoint $operation.element.frame $windowBounds
+                Send-MouseClick $hwnd $point.x $point.y "left" 1
             }
             "scroll" {
-                $handled = $false
-                if ($null -ne $element) {
-                    $handled = Invoke-Scroll $element $operation.direction ([double]$operation.pages)
-                }
-                if (-not $handled) {
-                    $point = Get-ScreenPoint $operation.element.frame $windowBounds
-                    Send-Scroll $hwnd $point.x $point.y $operation.direction ([double]$operation.pages)
-                }
+                if (-not (Ensure-Foreground $hwnd)) { throw "failed to bring app window to foreground" }
+                $fresh = Get-WindowRectFrame $hwnd
+                if ($null -ne $fresh) { $windowBounds = $fresh }
+                $point = Get-ScreenPoint $operation.element.frame $windowBounds
+                Send-Scroll $hwnd $point.x $point.y $operation.direction ([double]$operation.pages)
             }
             "drag" {
-                Send-Drag $hwnd ([int][math]::Round($windowBounds.x + [double]$operation.from_x)) ([int][math]::Round($windowBounds.y + [double]$operation.from_y)) ([int][math]::Round($windowBounds.x + [double]$operation.to_x)) ([int][math]::Round($windowBounds.y + [double]$operation.to_y))
+                if (-not (Ensure-Foreground $hwnd)) { throw "failed to bring app window to foreground" }
+                $fresh = Get-WindowRectFrame $hwnd
+                if ($null -ne $fresh) { $windowBounds = $fresh }
+                Send-Drag $hwnd ([int][math]::Round($windowBounds.x + [double]$operation.from_x)) ([int][math]::Round($windowBounds.y + [double]$operation.from_y)) ([int][math]::Round($windowBounds.x + [double]$operation.to_x)) ([int][math]::Round($windowBounds.y + [double]$operation.to_y)) $operation.mouse_button
             }
             "type_text" {
-                if (-not (Invoke-TypeText $process $operation.text)) {
-                    Send-Text $hwnd $operation.text
-                }
+                if (-not (Ensure-Foreground $hwnd)) { throw "keyboard input refused: app window did not get focus (text would go to another window)" }
+                Send-Text $hwnd $operation.text
             }
             "press_key" {
+                if (-not (Ensure-Foreground $hwnd)) { throw "keyboard input refused: app window did not get focus (key would go to another window)" }
                 Send-Key $hwnd $operation.key
             }
             "set_value" {
                 if ($null -eq $element) { throw "unknown element_index '$($operation.element.index)'" }
-                $valuePattern = Get-CurrentPatternOrNull $element ([Windows.Automation.ValuePattern]::Pattern)
-                if ($null -eq $valuePattern) {
-                    throw "Cannot set a value for an element that is not settable"
-                }
-                $valuePattern.SetValue($operation.value)
+                if (-not (Ensure-Foreground $hwnd)) { throw "failed to bring app window to foreground" }
+                $fresh = Get-WindowRectFrame $hwnd
+                if ($null -ne $fresh) { $windowBounds = $fresh }
+                $point = Get-ScreenPoint $operation.element.frame $windowBounds
+                Send-MouseClick $hwnd $point.x $point.y "left" 1
+                Start-Sleep -Milliseconds 100
+                Send-Key $hwnd "ctrl+a"
+                Start-Sleep -Milliseconds 50
+                Send-Text $hwnd $operation.value
             }
             default {
                 throw "unsupportedTool(`"$($operation.tool)`")"

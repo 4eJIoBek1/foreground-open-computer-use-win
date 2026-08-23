@@ -199,6 +199,7 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 			requiredFloat(args, "from_y"),
 			requiredFloat(args, "to_x"),
 			requiredFloat(args, "to_y"),
+			defaultString(optionalString(args, "mouse_button"), "left"),
 		)
 	case "type_text":
 		return s.typeText(requiredString(args, "app"), requiredString(args, "text"))
@@ -312,7 +313,7 @@ func (s *service) scroll(app, direction, elementIndex string, pages float64) too
 	return s.actionResult(app, psRequest{Tool: "scroll", App: app, Element: record, Direction: normalized, Pages: pages})
 }
 
-func (s *service) drag(app string, fromX, fromY, toX, toY *float64) toolCallResult {
+func (s *service) drag(app string, fromX, fromY, toX, toY *float64, mouseButton string) toolCallResult {
 	if app == "" {
 		return textResult("Missing required argument: app", true)
 	}
@@ -332,7 +333,7 @@ func (s *service) drag(app string, fromX, fromY, toX, toY *float64) toolCallResu
 	if snapshot == nil {
 		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
 	}
-	return s.actionResult(app, psRequest{Tool: "drag", App: app, FromX: fromX, FromY: fromY, ToX: toX, ToY: toY, WindowBounds: snapshot.WindowBounds})
+	return s.actionResult(app, psRequest{Tool: "drag", App: app, FromX: fromX, FromY: fromY, ToX: toX, ToY: toY, MouseButton: mouseButton, WindowBounds: snapshot.WindowBounds})
 }
 
 func (s *service) typeText(app, text string) toolCallResult {
@@ -548,11 +549,12 @@ func toolDefinitions() []toolDefinition {
 			Description: "Drag from one point to another using pixel coordinates. This tool is part of plugin `Computer Use`.",
 			Annotations: defaultAnnotations(),
 			InputSchema: objectSchema(map[string]any{
-				"app":    stringProperty("App name or bundle identifier"),
-				"from_x": numberProperty("Start X coordinate"),
-				"from_y": numberProperty("Start Y coordinate"),
-				"to_x":   numberProperty("End X coordinate"),
-				"to_y":   numberProperty("End Y coordinate"),
+				"app":          stringProperty("App name or bundle identifier"),
+				"from_x":       numberProperty("Start X coordinate"),
+				"from_y":       numberProperty("Start Y coordinate"),
+				"to_x":         numberProperty("End X coordinate"),
+				"to_y":         numberProperty("End Y coordinate"),
+				"mouse_button": enumStringProperty("Mouse button to drag with. Defaults to left.", []string{"left", "right", "middle"}),
 			}, []string{"app", "from_x", "from_y", "to_x", "to_y"}),
 		},
 		{
