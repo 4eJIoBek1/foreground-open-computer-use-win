@@ -48,16 +48,28 @@ Removed dead code: `Invoke-PreferredClick`, `Invoke-Scroll`, `Invoke-TypeText`, 
 ### `Ensure-Foreground` — bring target window to front before every action
 
 Real clicks require the target window to be foreground (otherwise they hit the window on top).
+Foreground alone is not enough: the click point itself is hit-tested with
+`WindowFromPoint` + `GetAncestor(GA_ROOT)`, so a click is never silently sent
+into an overlapping window owned by another process.
 
 ```powershell
-ShowWindow(SW_RESTORE=9)  # if minimized
+# Fast path (no window moves): foreground PID matches AND click point belongs to target
+# Raise path (up to 3 attempts, 150/300/600 ms):
+IsIconic? → ShowWindow(SW_RESTORE=9)  # minimized only, maximized windows stay maximized
 → AttachThreadInput(myThread, fgThread) # bypass foreground lock, no Alt-key trick
+→ SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT=0) … restore in finally
 → SetWindowPos(TOPMOST, SWP_NOMOVE|SWP_NOSIZE)
 → SetWindowPos(NOTOPMOST, SWP_NOMOVE|SWP_NOSIZE)
-→ SetForegroundWindow + SetFocus → detach → verify by PID (not handle)
+→ SetForegroundWindow + SetFocus → detach → verify by PID (not handle) + point hit-test
 ```
 
-Prevents hanging on hung windows via `IsHungAppWindow`. On `type_text`/`press_key` it hard-fails if focus cannot be obtained (text would go to wrong window). After raising, window rect is re-read and click/drag points are recalculated.
+Prevents hanging on hung windows via `IsHungAppWindow`. If the point stays covered,
+the action fails with `inputBlockedByOccluder(x,y,occluderPid,occluderProcess,occluderWindow)`
+instead of clicking into the wrong window; `main.go` surfaces the covering process
+(`psResponse.occluder`) in the MCP error text. On `type_text`/`press_key` only focus
+(PID) is required and it hard-fails if focus cannot be obtained (text would go to
+wrong window). After raising, window rect is re-read and click/drag points are
+recalculated, then hit-tested once more right before the input is sent.
 
 ### Side effects
 

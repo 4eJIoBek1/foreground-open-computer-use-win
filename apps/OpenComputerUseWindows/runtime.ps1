@@ -94,6 +94,21 @@ public static class OCUWin32 {
 
     [DllImport("user32.dll")]
     public static extern bool IsHungAppWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr WindowFromPoint(int x, int y);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll", EntryPoint = "SystemParametersInfo", SetLastError = true)]
+    public static extern bool SystemParametersInfoGetLockTimeout(uint uiAction, uint uiParam, out uint pvParam, uint fWinIni);
+
+    [DllImport("user32.dll", EntryPoint = "SystemParametersInfo", SetLastError = true)]
+    public static extern bool SystemParametersInfoSetLockTimeout(uint uiAction, uint uiParam, IntPtr pvParam, uint fWinIni);
 }
 "@
 
@@ -101,6 +116,9 @@ $SWP_NOSIZE = 0x0001
 $SWP_NOMOVE = 0x0002
 $HWND_TOPMOST = [IntPtr](-1)
 $HWND_NOTOPMOST = [IntPtr](-2)
+$GA_ROOT = 2
+$SPI_GETFOREGROUNDLOCKTIMEOUT = 0x2000
+$SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001
 
 function Test-EnvFlagEnabled([string]$name) {
     $value = [Environment]::GetEnvironmentVariable($name)
@@ -153,6 +171,23 @@ function Get-ScreenPoint($localFrame, $windowBounds) {
     [pscustomobject]@{
         x = [int][math]::Round($windowBounds.x + $localFrame.x + ($localFrame.width / 2))
         y = [int][math]::Round($windowBounds.y + $localFrame.y + ($localFrame.height / 2))
+    }
+}
+
+function Get-RequestPoint($operation, $windowBounds) {
+    if ($null -ne $operation.element -and $null -ne $operation.element.frame) {
+        return Get-ScreenPoint $operation.element.frame $windowBounds
+    }
+    return [pscustomobject]@{
+        x = [int][math]::Round($windowBounds.x + [double]$operation.x)
+        y = [int][math]::Round($windowBounds.y + [double]$operation.y)
+    }
+}
+
+function Get-WindowCenterPoint($windowBounds) {
+    return [pscustomobject]@{
+        x = [int][math]::Round($windowBounds.x + ([double]$windowBounds.width / 2))
+        y = [int][math]::Round($windowBounds.y + ([double]$windowBounds.height / 2))
     }
 }
 
@@ -319,35 +354,137 @@ function Test-IsTargetForeground([IntPtr]$hwnd) {
     }
 }
 
-function Ensure-Foreground([IntPtr]$hwnd) {
-    if (Test-IsTargetForeground $hwnd) {
-        return $true
-    }
-
-    [void][OCUWin32]::ShowWindow($hwnd, 9)
-
-    $fg = [OCUWin32]::GetForegroundWindow()
-    $myThread = [OCUWin32]::GetCurrentThreadId()
-    $fgThread = [OCUWin32]::GetWindowThreadProcessId($fg, [ref]0)
-
-    $attached = $false
-    if ($fgThread -ne $myThread -and -not [OCUWin32]::IsHungAppWindow($fg)) {
-        $attached = [OCUWin32]::AttachThreadInput($myThread, $fgThread, $true)
-    }
-
+function Get-OccluderInfo([IntPtr]$hwnd, [int]$x, [int]$y) {
     try {
-        [void][OCUWin32]::SetWindowPos($hwnd, $HWND_TOPMOST, 0, 0, 0, 0, $SWP_NOMOVE -bor $SWP_NOSIZE)
-        [void][OCUWin32]::SetWindowPos($hwnd, $HWND_NOTOPMOST, 0, 0, 0, 0, $SWP_NOMOVE -bor $SWP_NOSIZE)
-        [void][OCUWin32]::SetForegroundWindow($hwnd)
-        [void][OCUWin32]::SetFocus($hwnd)
-    } finally {
-        if ($attached) {
-            [void][OCUWin32]::AttachThreadInput($myThread, $fgThread, $false)
+        $hit = [OCUWin32]::WindowFromPoint($x, $y)
+        if ($hit -eq [IntPtr]::Zero) {
+            return [pscustomobject]@{ pid = 0; process = ""; title = "" }
+        }
+        $root = [OCUWin32]::GetAncestor($hit, $GA_ROOT)
+        if ($root -eq [IntPtr]::Zero) {
+            $root = $hit
+        }
+        if ($root -eq $hwnd) {
+            return $null
+        }
+        $rootPid = 0
+        $targetPid = 0
+        [void][OCUWin32]::GetWindowThreadProcessId($root, [ref]$rootPid)
+        [void][OCUWin32]::GetWindowThreadProcessId($hwnd, [ref]$targetPid)
+        if ($rootPid -ne 0 -and $rootPid -eq $targetPid) {
+            return $null
+        }
+        $procName = ""
+        $title = ""
+        try {
+            $owner = Get-Process -Id $rootPid -ErrorAction Stop
+            $procName = $owner.ProcessName
+            $title = $owner.MainWindowTitle
+        } catch {
+        }
+        return [pscustomobject]@{ pid = [int]$rootPid; process = [string]$procName; title = [string]$title }
+    } catch {
+        return $null
+    }
+}
+
+function Test-InputPointClear([IntPtr]$hwnd, [int]$x, [int]$y) {
+    return ($null -eq (Get-OccluderInfo $hwnd $x $y))
+}
+
+function New-OccludedError([IntPtr]$hwnd, $point) {
+    $occ = $script:lastOccluder
+    if ($null -eq $occ -and $null -ne $point) {
+        $occ = Get-OccluderInfo $hwnd ([int]$point.x) ([int]$point.y)
+    }
+    if ($null -ne $occ) {
+        $script:lastOccluder = $occ
+        return ("inputBlockedByOccluder(x={0},y={1},occluderPid={2},occluderProcess={3},occluderWindow={4})" -f [int]$point.x, [int]$point.y, $occ.pid, $occ.process, $occ.title)
+    }
+    return "failed to bring app window to foreground"
+}
+
+function Invoke-ForegroundRaise([IntPtr]$hwnd) {
+    try {
+        try {
+            if ([OCUWin32]::IsIconic($hwnd)) {
+                [void][OCUWin32]::ShowWindow($hwnd, 9)
+            }
+        } catch {
+        }
+
+        $fg = [OCUWin32]::GetForegroundWindow()
+        $myThread = [OCUWin32]::GetCurrentThreadId()
+        $fgThread = [OCUWin32]::GetWindowThreadProcessId($fg, [ref]0)
+
+        $attached = $false
+        try {
+            if ($fgThread -ne $myThread -and -not [OCUWin32]::IsHungAppWindow($fg)) {
+                $attached = [OCUWin32]::AttachThreadInput($myThread, $fgThread, $true)
+            }
+        } catch {
+            $attached = $false
+        }
+
+        $prevTimeout = 0
+        $timeoutTouched = $false
+        try {
+            try {
+                if ([OCUWin32]::SystemParametersInfoGetLockTimeout($SPI_GETFOREGROUNDLOCKTIMEOUT, 0, [ref]$prevTimeout, 0)) {
+                    $timeoutTouched = [OCUWin32]::SystemParametersInfoSetLockTimeout($SPI_SETFOREGROUNDLOCKTIMEOUT, 0, [IntPtr]::Zero, 0)
+                }
+            } catch {
+                $timeoutTouched = $false
+            }
+            if ([OCUWin32]::SetWindowPos($hwnd, $HWND_TOPMOST, 0, 0, 0, 0, ($SWP_NOMOVE -bor $SWP_NOSIZE))) {
+                [void][OCUWin32]::SetWindowPos($hwnd, $HWND_NOTOPMOST, 0, 0, 0, 0, ($SWP_NOMOVE -bor $SWP_NOSIZE))
+            }
+            [void][OCUWin32]::SetForegroundWindow($hwnd)
+            try {
+                [void][OCUWin32]::SetFocus($hwnd)
+            } catch {
+            }
+        } finally {
+            if ($timeoutTouched) {
+                try {
+                    [void][OCUWin32]::SystemParametersInfoSetLockTimeout($SPI_SETFOREGROUNDLOCKTIMEOUT, $prevTimeout, [IntPtr]::Zero, 0)
+                } catch {
+                }
+            }
+            if ($attached) {
+                try {
+                    [void][OCUWin32]::AttachThreadInput($myThread, $fgThread, $false)
+                } catch {
+                }
+            }
+        }
+    } catch {
+    }
+}
+
+function Ensure-Foreground([IntPtr]$hwnd, [int]$x, [int]$y, [switch]$KeysOnly) {
+    $script:lastOccluder = $null
+    if (Test-IsTargetForeground $hwnd) {
+        if ($KeysOnly -or (Test-InputPointClear $hwnd $x $y)) {
+            return $true
         }
     }
 
-    Start-Sleep -Milliseconds 150
-    return (Test-IsTargetForeground $hwnd)
+    $waits = @(150, 300, 600)
+    foreach ($wait in $waits) {
+        Invoke-ForegroundRaise $hwnd
+        Start-Sleep -Milliseconds $wait
+        if (Test-IsTargetForeground $hwnd) {
+            if ($KeysOnly -or (Test-InputPointClear $hwnd $x $y)) {
+                return $true
+            }
+        }
+    }
+
+    if (-not $KeysOnly) {
+        $script:lastOccluder = Get-OccluderInfo $hwnd $x $y
+    }
+    return $false
 }
 
 function Resolve-App([string]$query) {
@@ -742,54 +879,83 @@ try {
 
         switch ($operation.tool) {
             "click" {
-                if (-not (Ensure-Foreground $hwnd)) { throw "failed to bring app window to foreground" }
+                $point = Get-RequestPoint $operation $windowBounds
+                if (-not (Ensure-Foreground $hwnd ([int]$point.x) ([int]$point.y))) { throw (New-OccludedError $hwnd $point) }
                 $fresh = Get-WindowRectFrame $hwnd
-                if ($null -ne $fresh) { $windowBounds = $fresh }
-                if ($null -ne $operation.element -and $null -ne $operation.element.frame) {
-                    $point = Get-ScreenPoint $operation.element.frame $windowBounds
-                } else {
-                    $point = [pscustomobject]@{
-                        x = [int][math]::Round($windowBounds.x + [double]$operation.x)
-                        y = [int][math]::Round($windowBounds.y + [double]$operation.y)
-                    }
+                if ($null -ne $fresh) {
+                    $windowBounds = $fresh
+                    $point = Get-RequestPoint $operation $windowBounds
                 }
+                $script:lastOccluder = Get-OccluderInfo $hwnd ([int]$point.x) ([int]$point.y)
+                if ($null -ne $script:lastOccluder) { throw (New-OccludedError $hwnd $point) }
                 Send-MouseClick $hwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
             }
             "perform_secondary_action" {
                 if ($null -eq $element) { throw "unknown element_index '$($operation.element.index)'" }
-                if (-not (Ensure-Foreground $hwnd)) { throw "failed to bring app window to foreground" }
+                $point = Get-RequestPoint $operation $windowBounds
+                if (-not (Ensure-Foreground $hwnd ([int]$point.x) ([int]$point.y))) { throw (New-OccludedError $hwnd $point) }
                 $fresh = Get-WindowRectFrame $hwnd
-                if ($null -ne $fresh) { $windowBounds = $fresh }
-                $point = Get-ScreenPoint $operation.element.frame $windowBounds
+                if ($null -ne $fresh) {
+                    $windowBounds = $fresh
+                    $point = Get-RequestPoint $operation $windowBounds
+                }
+                $script:lastOccluder = Get-OccluderInfo $hwnd ([int]$point.x) ([int]$point.y)
+                if ($null -ne $script:lastOccluder) { throw (New-OccludedError $hwnd $point) }
                 Send-MouseClick $hwnd $point.x $point.y "left" 1
             }
             "scroll" {
-                if (-not (Ensure-Foreground $hwnd)) { throw "failed to bring app window to foreground" }
+                $point = Get-RequestPoint $operation $windowBounds
+                if (-not (Ensure-Foreground $hwnd ([int]$point.x) ([int]$point.y))) { throw (New-OccludedError $hwnd $point) }
                 $fresh = Get-WindowRectFrame $hwnd
-                if ($null -ne $fresh) { $windowBounds = $fresh }
-                $point = Get-ScreenPoint $operation.element.frame $windowBounds
+                if ($null -ne $fresh) {
+                    $windowBounds = $fresh
+                    $point = Get-RequestPoint $operation $windowBounds
+                }
+                $script:lastOccluder = Get-OccluderInfo $hwnd ([int]$point.x) ([int]$point.y)
+                if ($null -ne $script:lastOccluder) { throw (New-OccludedError $hwnd $point) }
                 Send-Scroll $hwnd $point.x $point.y $operation.direction ([double]$operation.pages)
             }
             "drag" {
-                if (-not (Ensure-Foreground $hwnd)) { throw "failed to bring app window to foreground" }
+                $fromPoint = [pscustomobject]@{
+                    x = [int][math]::Round($windowBounds.x + [double]$operation.from_x)
+                    y = [int][math]::Round($windowBounds.y + [double]$operation.from_y)
+                }
+                if (-not (Ensure-Foreground $hwnd ([int]$fromPoint.x) ([int]$fromPoint.y))) { throw (New-OccludedError $hwnd $fromPoint) }
                 $fresh = Get-WindowRectFrame $hwnd
                 if ($null -ne $fresh) { $windowBounds = $fresh }
-                Send-Drag $hwnd ([int][math]::Round($windowBounds.x + [double]$operation.from_x)) ([int][math]::Round($windowBounds.y + [double]$operation.from_y)) ([int][math]::Round($windowBounds.x + [double]$operation.to_x)) ([int][math]::Round($windowBounds.y + [double]$operation.to_y)) $operation.mouse_button
+                $fromX = [int][math]::Round($windowBounds.x + [double]$operation.from_x)
+                $fromY = [int][math]::Round($windowBounds.y + [double]$operation.from_y)
+                $toX = [int][math]::Round($windowBounds.x + [double]$operation.to_x)
+                $toY = [int][math]::Round($windowBounds.y + [double]$operation.to_y)
+                $script:lastOccluder = Get-OccluderInfo $hwnd $fromX $fromY
+                if ($null -ne $script:lastOccluder) { throw (New-OccludedError $hwnd ([pscustomobject]@{ x = $fromX; y = $fromY })) }
+                Send-Drag $hwnd $fromX $fromY $toX $toY $operation.mouse_button
             }
             "type_text" {
-                if (-not (Ensure-Foreground $hwnd)) { throw "keyboard input refused: app window did not get focus (text would go to another window)" }
+                $fresh = Get-WindowRectFrame $hwnd
+                if ($null -ne $fresh) { $windowBounds = $fresh }
+                $center = Get-WindowCenterPoint $windowBounds
+                if (-not (Ensure-Foreground $hwnd ([int]$center.x) ([int]$center.y) -KeysOnly)) { throw "keyboard input refused: app window did not get focus (text would go to another window)" }
                 Send-Text $hwnd $operation.text
             }
             "press_key" {
-                if (-not (Ensure-Foreground $hwnd)) { throw "keyboard input refused: app window did not get focus (key would go to another window)" }
+                $fresh = Get-WindowRectFrame $hwnd
+                if ($null -ne $fresh) { $windowBounds = $fresh }
+                $center = Get-WindowCenterPoint $windowBounds
+                if (-not (Ensure-Foreground $hwnd ([int]$center.x) ([int]$center.y) -KeysOnly)) { throw "keyboard input refused: app window did not get focus (key would go to another window)" }
                 Send-Key $hwnd $operation.key
             }
             "set_value" {
                 if ($null -eq $element) { throw "unknown element_index '$($operation.element.index)'" }
-                if (-not (Ensure-Foreground $hwnd)) { throw "failed to bring app window to foreground" }
+                $point = Get-RequestPoint $operation $windowBounds
+                if (-not (Ensure-Foreground $hwnd ([int]$point.x) ([int]$point.y))) { throw (New-OccludedError $hwnd $point) }
                 $fresh = Get-WindowRectFrame $hwnd
-                if ($null -ne $fresh) { $windowBounds = $fresh }
-                $point = Get-ScreenPoint $operation.element.frame $windowBounds
+                if ($null -ne $fresh) {
+                    $windowBounds = $fresh
+                    $point = Get-RequestPoint $operation $windowBounds
+                }
+                $script:lastOccluder = Get-OccluderInfo $hwnd ([int]$point.x) ([int]$point.y)
+                if ($null -ne $script:lastOccluder) { throw (New-OccludedError $hwnd $point) }
                 Send-MouseClick $hwnd $point.x $point.y "left" 1
                 Start-Sleep -Milliseconds 100
                 Send-Key $hwnd "ctrl+a"
@@ -810,6 +976,13 @@ try {
         $message = "$message at $($_.ScriptStackTrace)"
     }
     $response = [pscustomobject]@{ ok = $false; error = $message }
+    if ($null -ne $script:lastOccluder) {
+        $response | Add-Member -NotePropertyName occluder -NotePropertyValue ([pscustomobject]@{
+            pid = [int]$script:lastOccluder.pid
+            process = [string]$script:lastOccluder.process
+            windowTitle = [string]$script:lastOccluder.title
+        })
+    }
 }
 
 $response | ConvertTo-Json -Depth 50 -Compress

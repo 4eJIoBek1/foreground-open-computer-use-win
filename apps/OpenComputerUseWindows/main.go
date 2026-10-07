@@ -149,11 +149,18 @@ type psRequest struct {
 	WindowBounds *frame         `json:"windowBounds,omitempty"`
 }
 
+type occluderInfo struct {
+	PID         int    `json:"pid"`
+	ProcessName string `json:"process,omitempty"`
+	WindowTitle string `json:"windowTitle,omitempty"`
+}
+
 type psResponse struct {
-	OK       bool         `json:"ok"`
-	Text     string       `json:"text,omitempty"`
-	Error    string       `json:"error,omitempty"`
-	Snapshot *appSnapshot `json:"snapshot,omitempty"`
+	OK       bool          `json:"ok"`
+	Text     string        `json:"text,omitempty"`
+	Error    string        `json:"error,omitempty"`
+	Occluder *occluderInfo `json:"occluder,omitempty"`
+	Snapshot *appSnapshot  `json:"snapshot,omitempty"`
 }
 
 type service struct {
@@ -398,6 +405,9 @@ func (s *service) refreshSnapshot(app string, request psRequest) (*appSnapshot, 
 		return nil, textResult(err.Error(), true)
 	}
 	if !response.OK {
+		if response.Occluder != nil {
+			return nil, textResult(occludedTargetError(app, response), true)
+		}
 		return nil, textResult(response.Error, true)
 	}
 	if response.Snapshot == nil {
@@ -405,6 +415,25 @@ func (s *service) refreshSnapshot(app string, request psRequest) (*appSnapshot, 
 	}
 	s.rememberSnapshot(app, response.Snapshot)
 	return response.Snapshot, toolCallResult{}
+}
+
+func occludedTargetError(app string, response *psResponse) string {
+	base := strings.TrimSpace(response.Error)
+	if base == "" {
+		base = "input blocked"
+	}
+	target := strings.TrimSpace(app)
+	if target == "" {
+		target = "the target app"
+	}
+	covering := fmt.Sprintf("pid=%d", response.Occluder.PID)
+	if response.Occluder.ProcessName != "" {
+		covering += fmt.Sprintf(" process=%s", response.Occluder.ProcessName)
+	}
+	if response.Occluder.WindowTitle != "" {
+		covering += fmt.Sprintf(" window=%q", response.Occluder.WindowTitle)
+	}
+	return fmt.Sprintf("%s for %s: the input point is covered by another window (%s). The click was not sent. Bring %s to the front or choose an uncovered point and retry.", base, target, covering, target)
 }
 
 func (s *service) rememberSnapshot(query string, snapshot *appSnapshot) {
