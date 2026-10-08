@@ -95,8 +95,19 @@ public static class OCUWin32 {
     [DllImport("user32.dll")]
     public static extern bool IsHungAppWindow(IntPtr hWnd);
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT {
+        public int X;
+        public int Y;
+    }
+
+    // NB: WindowFromPoint takes a POINT struct BY VALUE. Do NOT declare it as
+    // (int x, int y): on x64 a by-value struct travels in a single register
+    // while two ints travel in two registers, so the native side would read
+    // Y from the upper half of the first register (always 0) and every
+    // hit-test would land on the top screen edge.
     [DllImport("user32.dll")]
-    public static extern IntPtr WindowFromPoint(int x, int y);
+    public static extern IntPtr WindowFromPoint(POINT Point);
 
     [DllImport("user32.dll")]
     public static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
@@ -356,7 +367,10 @@ function Test-IsTargetForeground([IntPtr]$hwnd) {
 
 function Get-OccluderInfo([IntPtr]$hwnd, [int]$x, [int]$y) {
     try {
-        $hit = [OCUWin32]::WindowFromPoint($x, $y)
+        $pt = New-Object OCUWin32+POINT
+        $pt.X = $x
+        $pt.Y = $y
+        $hit = [OCUWin32]::WindowFromPoint($pt)
         if ($hit -eq [IntPtr]::Zero) {
             return [pscustomobject]@{ pid = 0; process = ""; title = "" }
         }

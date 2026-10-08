@@ -32,3 +32,12 @@ Foreground-PID match does not imply the click point is visible: a previous raise
 - `go build` OK, `go vet` OK, PowerShell parser: 0 syntax errors.
 - `go test`: only pre-existing failure `TestWindowsRuntimeForegroundActionsRequireOptIn` (fails on main before this change too: the fork runtime intentionally uses `SetFocus` unconditionally, the template test expects opt-in flags).
 - No live run of the new binary (per user request); test battery (primary/secondary monitor clicks, deliberate occlusion) is left for the user.
+
+### Follow-up fix (same task, 2026-10-08)
+- Live testing showed every hit-test resolving to the desktop (`occluder=explorer`).
+  Root cause: `WindowFromPoint(int x, int y)` P/Invoke is wrong on x64 — a by-value
+  `POINT` struct travels in one register, two ints in two, so native code always
+  read Y=0 (top screen edge). Verified empirically: struct-style declaration hits
+  the right window, int-pair style always hits the desktop. Fixed by declaring
+  `POINT` struct by value; all other P/Invokes in the file take scalars or
+  pointers and are unaffected.
